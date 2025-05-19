@@ -9,8 +9,8 @@ class Message(BaseModel):
 app = FastAPI()
 
 # Load the model and vectorizer
-model = joblib.load("best_spam_model.joblib")
-vectorizer = joblib.load("spam_vectorizer.joblib")
+model = joblib.load("spam_model.pkl")
+vectorizer = joblib.load("vectorizer.pkl")
 
 @app.get("/")
 def root():
