@@ -8,6 +8,16 @@ class Message(BaseModel):
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or restrict to ["http://localhost:8000"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Load the model and vectorizer
 model = joblib.load("spam_model.pkl")
 vectorizer = joblib.load("vectorizer.pkl")
@@ -22,4 +32,4 @@ def predict(msg: Message):
     vector = vectorizer.transform(text)
     pred = model.predict(vector)[0]
     result = "spam" if pred == 1 else "ham"
-    return {"prediction": result}
+    return {"prediction": result} 
