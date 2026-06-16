@@ -12,15 +12,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or restrict to ["http://localhost:8000"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load the model and vectorizer
+# spam_model.pkl is a full sklearn Pipeline (preprocessor + TF-IDF + classifier)
+# so raw text is passed directly — no separate vectorizer step needed.
 model = joblib.load("spam_model.pkl")
-vectorizer = joblib.load("vectorizer.pkl")
 
 @app.get("/")
 def root():
@@ -28,8 +28,6 @@ def root():
 
 @app.post("/predict")
 def predict(msg: Message):
-    text = [msg.text]
-    vector = vectorizer.transform(text)
-    pred = model.predict(vector)[0]
+    pred = model.predict([msg.text])[0]
     result = "spam" if pred == 1 else "ham"
-    return {"prediction": result} 
+    return {"prediction": result}
