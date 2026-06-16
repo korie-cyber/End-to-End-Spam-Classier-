@@ -1,5 +1,6 @@
-
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 
@@ -7,8 +8,6 @@ class Message(BaseModel):
     text: str
 
 app = FastAPI()
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,12 +18,11 @@ app.add_middleware(
 )
 
 # spam_model.pkl is a full sklearn Pipeline (preprocessor + TF-IDF + classifier)
-# so raw text is passed directly — no separate vectorizer step needed.
 model = joblib.load("spam_model.pkl")
 
 @app.get("/")
 def root():
-    return {"status": "Spam Classifier Ready"}
+    return FileResponse("spam-classifier-frontend/index.html")
 
 @app.post("/predict")
 def predict(msg: Message):
