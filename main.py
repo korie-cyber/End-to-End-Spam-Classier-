@@ -28,6 +28,32 @@ SYNTHETIC_TOKENS = frozenset({
     "multiexclaim", "multiquestion", "numtoken",
 })
 
+# Common function words that are never meaningful security signals,
+# regardless of their TF-IDF contribution.  An n-gram is filtered
+# only when ALL of its tokens are in this set (so "click here" passes
+# because "click" is not a stopword, while "here are" is filtered).
+_FLAGGED_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "for", "in", "on", "at",
+    "to", "of", "by", "as", "if", "so", "no", "up",
+    "i", "me", "my", "we", "us", "our", "you", "your",
+    "he", "she", "it", "its", "they", "them", "their",
+    "this", "that", "these", "those", "who", "what", "which",
+    "where", "when", "how", "than", "then",
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "do", "does", "did",
+    "will", "would", "can", "could", "may", "might", "shall", "should",
+    "get", "got", "let", "make", "made", "take", "come", "go",
+    "see", "know", "think", "say", "said", "tell", "give",
+    "not", "very", "just", "also", "still", "already", "even",
+    "more", "most", "much", "many", "some", "any", "all", "each",
+    "here", "there", "now", "well", "too", "really", "about",
+    "only", "over", "after", "before", "back", "out", "into",
+    "one", "two", "new", "good", "great", "way", "day", "time",
+    "thing", "things", "like", "look", "need", "want", "keep",
+    "thats", "heres", "youre", "dont", "cant", "wont", "isnt",
+    "whats", "weve", "youve", "theyre", "didnt", "doesnt",
+})
+
 
 # ── Request schema ────────────────────────────────────
 class Message(BaseModel):
@@ -58,12 +84,19 @@ def extract_flagged_phrases(text: str, predicted_class: int,
     """Return the top-N input phrases whose TF-IDF × SVM-coefficient
     contribution was highest for the predicted class.
 
-    This is a real extraction from the fitted vectorizer and classifier:
-    1. Preprocess & vectorize the text through the same pipeline steps
-    2. Multiply each feature's TF-IDF weight by the averaged SVM
-       coefficient for the predicted class
-    3. Rank by contribution, filter out synthetic tokens
+    Filters applied:
+    - Ham predictions return [] (nothing to flag in safe email)
+    - Minimum contribution threshold: 75th percentile of positive
+      contributions AND an absolute floor of 0.01, so only features
+      with genuinely strong signal qualify
+    - Synthetic preprocessor tokens (urltoken etc.) excluded
+    - N-grams composed entirely of stopwords excluded
+    - If nothing survives filtering, returns [] rather than forcing
+      weak features through
     """
+    if predicted_class == 0:
+        return []
+
     preprocessed = model.named_steps["preprocessor"].transform([text])
     tfidf_vec = model.named_steps["tfidf"].transform(preprocessed)
 
@@ -72,17 +105,28 @@ def extract_flagged_phrases(text: str, predicted_class: int,
 
     contributions = tfidf_arr * AVG_COEF[predicted_class]
 
-    pos_idx = np.where(contributions > 0)[0]
-    if len(pos_idx) == 0:
+    pos_mask = contributions > 0
+    if not pos_mask.any():
         return []
 
-    ranked = pos_idx[np.argsort(contributions[pos_idx])[::-1]]
+    pos_values = contributions[pos_mask]
+    threshold = max(np.percentile(pos_values, 75), 0.01)
+
+    strong_idx = np.where(contributions >= threshold)[0]
+    if len(strong_idx) == 0:
+        return []
+
+    ranked = strong_idx[np.argsort(contributions[strong_idx])[::-1]]
 
     phrases = []
     for idx in ranked:
         fname = FEATURE_NAMES[idx]
         tokens = fname.split()
         if any(t in SYNTHETIC_TOKENS for t in tokens):
+            continue
+        if all(t in _FLAGGED_STOPWORDS for t in tokens):
+            continue
+        if all(len(t) <= 1 for t in tokens):
             continue
         phrases.append(fname)
         if len(phrases) >= top_n:
@@ -180,21 +224,58 @@ _URGENCY_PHRASES = [
     "your account has been", "unauthorized", "security alert",
 ]
 
-_FINANCIAL_PHRASES = [
-    "winner", "won", "prize", "reward", "gift card", "free",
-    "congratulations", "selected", "lottery", "jackpot",
-    "claim", "collect", "cash", "credit", "loan", "investment",
-    "income", "earn", "profit", "discount", "offer", "deal",
-    "no cost", "cheap", "buy now",
+# Hard financial indicators: scam-specific patterns rarely seen in
+# legitimate email.  These trigger on their own.
+_FINANCIAL_HARD = [
+    "winner", "won", "lottery", "jackpot", "prize", "reward",
+    "gift card", "congratulations", "claim your", "collect your",
+    "no cost", "buy now",
+]
+
+# Soft financial indicators: words that appear in both scam AND
+# legitimate contexts (newsletters, course platforms, charities).
+# These only count when corroborated by urgency language or
+# suspicious links — a freeCodeCamp email mentioning "free courses"
+# shouldn't trigger financial_incentive on its own.
+_FINANCIAL_SOFT = [
+    "free", "offer", "deal", "discount", "cheap",
+    "cash", "credit", "loan", "investment",
+    "income", "earn", "profit",
 ]
 
 
-def _score_phrases(text: str, phrases: list[str]) -> str:
+def _score_urgency(text: str) -> str:
     lower = text.lower()
-    hits = sum(1 for p in phrases if p in lower)
+    hits = sum(1 for p in _URGENCY_PHRASES if p in lower)
     if hits >= 3:
         return "High"
     if hits >= 1:
+        return "Medium"
+    return "Low"
+
+
+def _score_financial(text: str, urgency: str, links: str) -> str:
+    """Score financial incentive with co-occurrence gating.
+
+    Hard indicators (lottery, prize, winner, etc.) always count.
+    Soft indicators (free, offer, earn, etc.) only count when another
+    risk signal (urgency or suspicious links) is Medium or higher,
+    preventing false positives on legitimate newsletters/charities.
+    """
+    lower = text.lower()
+
+    hard = sum(1 for p in _FINANCIAL_HARD if p in lower)
+    soft = sum(1 for p in _FINANCIAL_SOFT if p in lower)
+
+    score = hard
+
+    corroborated = urgency in ("Medium", "High") or links in ("Medium", "High")
+    if corroborated:
+        score += soft
+
+    if score >= 3:
+        return "High"
+    if score >= 1:
         return "Medium"
     return "Low"
 
@@ -247,15 +328,19 @@ def predict(msg: Message):
     # 0 = certainly safe and 100 = certainly dangerous.
     risk_score = max(0, min(100, round(100 - float(probs[0]) * 100)))
 
+    # Compute independent signals first, then financial (needs the others)
+    urgency = _score_urgency(msg.text)
+    links = analyze_links(msg.text)
+    financial = _score_financial(msg.text, urgency, links)
+
     return {
         "prediction": prediction,
         "confidence": confidence,
         "risk_score": risk_score,
         "signals": {
-            "urgent_language": _score_phrases(msg.text, _URGENCY_PHRASES),
-            "suspicious_links": analyze_links(msg.text),
-            "financial_incentive": _score_phrases(msg.text,
-                                                  _FINANCIAL_PHRASES),
+            "urgent_language": urgency,
+            "suspicious_links": links,
+            "financial_incentive": financial,
             "sender_trust": assess_sender(msg.sender_domain),
         },
         "flagged_phrases": extract_flagged_phrases(msg.text,
