@@ -258,9 +258,11 @@ def _score_financial(text: str, urgency: str, links: str) -> str:
     """Score financial incentive with co-occurrence gating.
 
     Hard indicators (lottery, prize, winner, etc.) always count.
-    Soft indicators (free, offer, earn, etc.) only count when another
-    risk signal (urgency or suspicious links) is Medium or higher,
-    preventing false positives on legitimate newsletters/charities.
+    Soft indicators (free, offer, earn, etc.) only count when
+    corroborated by a STRONG risk signal:
+      - Any urgency language (Medium or High), OR
+      - High suspicious links (not Medium — a newsletter with many
+        legitimate links scores Medium, which is not a scam signal)
     """
     lower = text.lower()
 
@@ -269,7 +271,7 @@ def _score_financial(text: str, urgency: str, links: str) -> str:
 
     score = hard
 
-    corroborated = urgency in ("Medium", "High") or links in ("Medium", "High")
+    corroborated = urgency in ("Medium", "High") or links == "High"
     if corroborated:
         score += soft
 
