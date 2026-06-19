@@ -900,6 +900,14 @@ async function runAnalysis() {
   times.push(getTime()); stepUpdate(2,'active'); await delay(450); stepUpdate(2,'done');
   times.push(getTime()); stepUpdate(3,'active');
 
+  /* Try to extract sender_domain from a "From:" header in the pasted text.
+     Matches formats like  From: user@example.com
+                           From: "Name" <user@example.com>
+     Falls back to omitting the field if not found. */
+  const fromMatch = text.match(/\bFrom:\s*(?:.*?<)?[^@<\s]+@([^>\s,;]+)/i);
+  const reqBody = { text };
+  if (fromMatch) reqBody.sender_domain = fromMatch[1];
+
   let apiResult = null;
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 15000);
@@ -908,7 +916,7 @@ async function runAnalysis() {
     const res = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify(reqBody),
       signal: controller.signal
     });
     clearTimeout(tid);
@@ -929,90 +937,92 @@ async function runAnalysis() {
   times.push(getTime()); stepUpdate(5,'active'); await delay(380); stepUpdate(5,'done');
   prog.classList.add('hidden');
 
-  const isSpam = apiResult.prediction === 'spam';
-  const lower  = text.toLowerCase();
+  /* ── Every value below comes directly from the API response.
+     No client-side keyword arrays, score fabrication, or signal
+     computation — the backend model owns all of these. ─────── */
 
-  const allKeywords = [
-    'winner','congratulations','click immediately','bank details','act now','urgent',
-    'prize','free','limited time','no prescription','cheap','buy now','claim','selected',
-    'lottery','credit','verify','account limited','suspended','confirm your','paypal',
-    'login','click here','identity','offer','discount'
-  ];
-  const flags    = allKeywords.filter(w => lower.includes(w));
-  const rawScore = flags.length * 7;
-  const score    = isSpam
-    ? Math.min(Math.max(rawScore + 55, 62), 97)
-    : Math.min(rawScore, 36);
+  const prediction = apiResult.prediction;       // "ham" | "spam" | "phishing"
+  const confidence = apiResult.confidence;        // 0-1 calibrated probability
+  const riskScore  = apiResult.risk_score;        // 0-100
+  const signals    = apiResult.signals;           // {urgent_language, suspicious_links, ...}
+  const flagged    = apiResult.flagged_phrases;   // real TF-IDF extracted phrases
+  const tags       = apiResult.category_tags;     // ["Phishing"] | ["Spam"] | ["Likely safe"]
 
-  const confidence     = isSpam ? Math.min(score + 4, 99) : Math.max(100 - score - 4, 63);
-  const classification = score > 70 ? 'Spam / Phishing' : score > 40 ? 'Suspicious' : isSpam ? 'Spam Detected' : 'Safe';
+  const isDanger   = prediction !== 'ham';
 
-  const sigs = [
-    { name: 'Urgent language',     val: flags.some(f => ['urgent','act now','click immediately'].includes(f)) ? 'High' : isSpam ? 'Medium' : 'Low' },
-    { name: 'Suspicious links',    val: (lower.includes('http') || /\S+\.(ru|win|xyz|club)\b/.test(lower) || lower.includes('verify') || lower.includes('click here')) ? 'High' : 'Low' },
-    { name: 'Financial incentive', val: flags.some(f => ['prize','winner','free','cheap','claim','credit','offer','discount'].includes(f)) ? 'High' : isSpam ? 'Medium' : 'Low' },
-    { name: 'Sender trust',        val: isSpam ? (score > 70 ? 'Low' : 'Medium') : 'High' }
-  ];
+  const verdictText = prediction === 'phishing' ? 'Phishing Detected'
+                    : prediction === 'spam'     ? 'Spam Detected'
+                    :                             'Safe';
 
-  const tagList = [];
-  if (/winner|prize|lottery/.test(lower))   tagList.push({ label: 'Scam',        cls: 'scam' });
-  if (/verify|login|suspended/.test(lower)) tagList.push({ label: 'Phishing',    cls: 'phishing' });
-  if (isSpam)                               tagList.push({ label: 'Spam',         cls: 'spam' });
-  if (!isSpam)                              tagList.push({ label: 'Likely safe',  cls: 'safe' });
-
-  let explanation;
-  if (isSpam && flags.length > 0) {
-    const quoted = flags.slice(0,3).map(f => `"<span class='highlighted-text'>${f}</span>"`).join(', ');
-    explanation = `Our ML classifier identified this as spam. The phrase${flags.length > 1 ? 's' : ''} ${quoted} triggered multiple indicators in our model.`;
-  } else if (isSpam) {
-    explanation = 'Our ML model detected spam patterns in this message. The overall language structure matches spam signatures in our training data, even without common keyword triggers.';
-  } else {
-    explanation = 'This email appears to be legitimate. Our ML classifier found no significant spam or phishing patterns. The language and structure match typical safe correspondence.';
-  }
-
-  const rec = isSpam
-    ? '<i class="ti ti-alert-triangle" aria-hidden="true"></i>&nbsp; Do not click any links. Move to spam. Do not share personal information.'
-    : '<i class="ti ti-circle-check"   aria-hidden="true"></i>&nbsp; This email appears safe. Standard caution still applies.';
-
-  /* Render */
-  document.getElementById('resultCard').className = 'result-card ' + (isSpam ? 'danger' : 'safe');
+  /* ── Render result card ──────────────────────────── */
+  document.getElementById('resultCard').className = 'result-card ' + (isDanger ? 'danger' : 'safe');
 
   const vi = document.getElementById('verdictIcon');
-  vi.className = 'verdict-icon ' + (isSpam ? 'danger' : 'safe');
-  vi.innerHTML = isSpam
+  vi.className = 'verdict-icon ' + (isDanger ? 'danger' : 'safe');
+  vi.innerHTML = isDanger
     ? '<i class="ti ti-shield-x"     aria-hidden="true"></i>'
     : '<i class="ti ti-shield-check" aria-hidden="true"></i>';
 
-  document.getElementById('verdictLabel').textContent = classification;
-  document.getElementById('verdictSub').textContent   = confidence + '% confidence';
+  document.getElementById('verdictLabel').textContent = verdictText;
+  document.getElementById('verdictSub').textContent   = Math.round(confidence * 100) + '% confidence';
 
   const sn = document.getElementById('scoreNum');
-  sn.className   = 'score-num ' + (isSpam ? 'danger' : 'safe');
-  sn.textContent = score;
+  sn.className   = 'score-num ' + (isDanger ? 'danger' : 'safe');
+  sn.textContent = riskScore;
 
   const mf = document.getElementById('meterFill');
-  mf.className   = 'meter-fill ' + (isSpam ? 'danger' : 'safe');
+  mf.className   = 'meter-fill ' + (isDanger ? 'danger' : 'safe');
   mf.style.width = '0%';
-  setTimeout(() => { mf.style.width = score + '%'; }, 80);
+  setTimeout(() => { mf.style.width = riskScore + '%'; }, 80);
 
-  document.getElementById('signals').innerHTML = sigs.map(s =>
-    `<div class="signal"><div class="signal-name">${s.name}</div><div class="signal-val ${s.val.toLowerCase()}">${s.val}</div></div>`
+  /* ── Signal cards — directly from API ────────────── */
+  const sigEntries = [
+    { name: 'Urgent language',     val: signals.urgent_language },
+    { name: 'Suspicious links',    val: signals.suspicious_links },
+    { name: 'Financial incentive', val: signals.financial_incentive },
+    { name: 'Sender trust',        val: signals.sender_trust },
+  ];
+  document.getElementById('signals').innerHTML = sigEntries.map(s => {
+    const cls = (s.val === 'Not available') ? 'low' : s.val.toLowerCase();
+    return `<div class="signal"><div class="signal-name">${s.name}</div><div class="signal-val ${cls}">${s.val}</div></div>`;
+  }).join('');
+
+  /* ── Tags — directly from API category_tags ──────── */
+  const tagCls = { 'Likely safe': 'safe', 'Spam': 'spam', 'Phishing': 'phishing' };
+  document.getElementById('tagRow').innerHTML = tags.map(t =>
+    `<span class="tag ${tagCls[t] || 'safe'}">${t}</span>`
   ).join('');
 
-  document.getElementById('tagRow').innerHTML = tagList.map(t =>
-    `<span class="tag ${t.cls}">${t.label}</span>`
-  ).join('');
+  /* ── Analyst explanation — uses API prediction + flagged_phrases ── */
+  let explanation;
+  if (isDanger && flagged.length > 0) {
+    const quoted = flagged.slice(0,3).map(f =>
+      `"<span class='highlighted-text'>${f}</span>"`).join(', ');
+    explanation = `Our ML classifier identified this as <strong>${prediction}</strong>. `
+      + `The phrase${flagged.length > 1 ? 's' : ''} ${quoted} contributed most to this prediction.`;
+  } else if (isDanger) {
+    explanation = `Our ML model classified this as <strong>${prediction}</strong>. `
+      + `The overall language structure matches ${prediction} signatures in our training data.`;
+  } else {
+    explanation = 'This email appears to be legitimate. Our ML classifier found no significant '
+      + 'spam or phishing patterns. The language and structure match typical safe correspondence.';
+  }
 
   document.getElementById('analystBubble').innerHTML   = explanation;
   document.getElementById('analystStatus').textContent = 'Analysis complete · ' + new Date().toLocaleTimeString();
 
-  if (flags.length > 0) {
+  /* ── Flagged phrases — directly from API ─────────── */
+  if (flagged.length > 0) {
     document.getElementById('highlightSection').classList.remove('hidden');
-    document.getElementById('highlightedPhrases').innerHTML = flags.slice(0,6)
+    document.getElementById('highlightedPhrases').innerHTML = flagged.slice(0,6)
       .map(f => `<span class="highlighted-text" style="margin-right:8px">${f}</span>`).join('');
   } else {
     document.getElementById('highlightSection').classList.add('hidden');
   }
+
+  const rec = isDanger
+    ? '<i class="ti ti-alert-triangle" aria-hidden="true"></i>&nbsp; Do not click any links. Move to spam. Do not share personal information.'
+    : '<i class="ti ti-circle-check"   aria-hidden="true"></i>&nbsp; This email appears safe. Standard caution still applies.';
 
   document.getElementById('recommendationBox').innerHTML = rec;
   document.getElementById('timelineRows').innerHTML = times.map((t,i) =>

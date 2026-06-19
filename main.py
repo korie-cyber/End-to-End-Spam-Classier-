@@ -1,12 +1,41 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import joblib
+import re
+from typing import Optional
 
+import joblib
+import numpy as np
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from scipy.sparse import issparse
+
+# ── Labels ────────────────────────────────────────────
+LABELS = ["ham", "spam", "phishing"]
+TAG_MAP = {"ham": ["Likely safe"], "spam": ["Spam"], "phishing": ["Phishing"]}
+
+# ── Load model + pre-extract coefficients ─────────────
+model = joblib.load("spam_model_v2.pkl")
+
+_coefs = [cc.estimator.coef_ for cc in
+          model.named_steps["clf"].calibrated_classifiers_]
+AVG_COEF = np.mean(_coefs, axis=0)          # (3, n_features)
+FEATURE_NAMES = model.named_steps["tfidf"].get_feature_names_out()
+
+# Synthetic tokens injected by TextPreprocessor — useful for the model
+# but meaningless as user-facing "flagged phrases", so we skip them.
+SYNTHETIC_TOKENS = frozenset({
+    "urltoken", "emailtoken", "capstoken", "moneytoken",
+    "multiexclaim", "multiquestion", "numtoken",
+})
+
+
+# ── Request schema ────────────────────────────────────
 class Message(BaseModel):
     text: str
+    sender_domain: Optional[str] = None
 
+
+# ── App ───────────────────────────────────────────────
 app = FastAPI()
 
 app.add_middleware(
@@ -17,15 +46,219 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# spam_model.pkl is a full sklearn Pipeline (preprocessor + TF-IDF + classifier)
-model = joblib.load("spam_model.pkl")
+
+# ═══════════════════════════════════════════════════════
+# SIGNAL ANALYSIS
+# ═══════════════════════════════════════════════════════
+
+# ── Flagged phrases: real TF-IDF feature extraction ───
+
+def extract_flagged_phrases(text: str, predicted_class: int,
+                            top_n: int = 6) -> list[str]:
+    """Return the top-N input phrases whose TF-IDF × SVM-coefficient
+    contribution was highest for the predicted class.
+
+    This is a real extraction from the fitted vectorizer and classifier:
+    1. Preprocess & vectorize the text through the same pipeline steps
+    2. Multiply each feature's TF-IDF weight by the averaged SVM
+       coefficient for the predicted class
+    3. Rank by contribution, filter out synthetic tokens
+    """
+    preprocessed = model.named_steps["preprocessor"].transform([text])
+    tfidf_vec = model.named_steps["tfidf"].transform(preprocessed)
+
+    tfidf_arr = (tfidf_vec.toarray()[0] if issparse(tfidf_vec)
+                 else tfidf_vec[0])
+
+    contributions = tfidf_arr * AVG_COEF[predicted_class]
+
+    pos_idx = np.where(contributions > 0)[0]
+    if len(pos_idx) == 0:
+        return []
+
+    ranked = pos_idx[np.argsort(contributions[pos_idx])[::-1]]
+
+    phrases = []
+    for idx in ranked:
+        fname = FEATURE_NAMES[idx]
+        tokens = fname.split()
+        if any(t in SYNTHETIC_TOKENS for t in tokens):
+            continue
+        phrases.append(fname)
+        if len(phrases) >= top_n:
+            break
+
+    return phrases
+
+
+# ── Suspicious links: real URL/regex analysis ─────────
+
+_URL_RE = re.compile(
+    r'https?://\S+'
+    r'|www\.\S+'
+    r'|\b\S+\.(?:com|net|org|co\.uk|info|biz|win|club|xyz|tv|io|co)\b',
+    re.IGNORECASE,
+)
+
+_IP_URL_RE = re.compile(r'https?://\d{1,3}(?:\.\d{1,3}){3}')
+
+_SHORTENERS = frozenset({
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd",
+    "buff.ly", "rebrand.ly", "shorturl.at", "tiny.cc", "cutt.ly",
+})
+
+_SUSPICIOUS_TLDS = re.compile(
+    r'\.(?:ru|cn|xyz|win|club|biz|top|buzz|tk|ml|ga|cf)\b', re.IGNORECASE)
+
+# Domains that embed a well-known brand name with extra words/hyphens
+# (e.g. paypal-secure-verify.com, apple-id-support.net)
+_BRAND_MIMIC_RE = re.compile(
+    r'(?:paypal|apple|google|microsoft|amazon|netflix|bank|secure|verify'
+    r'|account|login|support)[\w-]*\.'
+    r'(?:com|net|org|info|co|xyz|biz|win|club)\b',
+    re.IGNORECASE,
+)
+
+
+def analyze_links(text: str) -> str:
+    """Score link suspicion based on real URL parsing.
+
+    Checks:
+      - Raw IP-based URLs                          (+3)
+      - Known URL-shortener domains                (+2 each)
+      - Non-HTTPS links (http://)                  (+1 each)
+      - Suspicious TLDs (.ru, .xyz, .win, etc.)    (+2 each)
+      - Domain mimics a known brand (e.g.
+        paypal-secure-verify.com)                  (+2)
+      - Excessive link count (>3)                  (+2)
+
+    Returns "High" (>=4), "Medium" (>=2), or "Low".
+    """
+    urls = _URL_RE.findall(text)
+    if not urls:
+        return "Low"
+
+    score = 0
+
+    if _IP_URL_RE.search(text):
+        score += 3
+
+    for url in urls:
+        low = url.lower()
+        if any(s in low for s in _SHORTENERS):
+            score += 2
+        if low.startswith("http://"):
+            score += 1
+        if _SUSPICIOUS_TLDS.search(low):
+            score += 2
+        if _BRAND_MIMIC_RE.search(low):
+            score += 2
+
+    if len(urls) > 3:
+        score += 2
+
+    if score >= 4:
+        return "High"
+    if score >= 2:
+        return "Medium"
+    return "Low"
+
+
+# ── Urgent language & financial incentive ─────────────
+# Heuristic display layer: these curated phrase lists are used ONLY for
+# the UI signal indicators.  They are NOT derived from the model's
+# internal feature weights — the model makes its prediction independently
+# via TF-IDF + SVM.  These lists simply highlight common threat patterns
+# so the user gets a quick visual summary alongside the model's verdict.
+
+_URGENCY_PHRASES = [
+    "urgent", "immediately", "act now", "right away", "asap",
+    "expires", "limited time", "last chance", "don't delay",
+    "within 24 hours", "within 48 hours", "account will be",
+    "suspended", "terminated", "closed", "locked", "verify now",
+    "confirm now", "respond immediately", "action required",
+    "your account has been", "unauthorized", "security alert",
+]
+
+_FINANCIAL_PHRASES = [
+    "winner", "won", "prize", "reward", "gift card", "free",
+    "congratulations", "selected", "lottery", "jackpot",
+    "claim", "collect", "cash", "credit", "loan", "investment",
+    "income", "earn", "profit", "discount", "offer", "deal",
+    "no cost", "cheap", "buy now",
+]
+
+
+def _score_phrases(text: str, phrases: list[str]) -> str:
+    lower = text.lower()
+    hits = sum(1 for p in phrases if p in lower)
+    if hits >= 3:
+        return "High"
+    if hits >= 1:
+        return "Medium"
+    return "Low"
+
+
+# ── Sender trust ──────────────────────────────────────
+
+_TRUSTED_DOMAINS = frozenset({
+    "google.com", "gmail.com", "microsoft.com", "outlook.com",
+    "apple.com", "amazon.com", "linkedin.com", "github.com",
+    "slack.com", "zoom.us", "salesforce.com",
+})
+
+_FREE_EMAIL_DOMAINS = frozenset({
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
+    "icloud.com", "mail.com", "protonmail.com", "proton.me", "yandex.com",
+    "gmx.com", "zoho.com",
+})
+
+
+def assess_sender(domain: Optional[str]) -> str:
+    if not domain:
+        return "Not available"
+    d = domain.lower().strip()
+    if d in _TRUSTED_DOMAINS:
+        return "High"
+    if d in _FREE_EMAIL_DOMAINS:
+        return "Medium"
+    return "Low"
+
+
+# ═══════════════════════════════════════════════════════
+# ROUTES
+# ═══════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
     return FileResponse("spam-classifier-frontend/index.html")
 
+
 @app.post("/predict")
 def predict(msg: Message):
-    pred = model.predict([msg.text])[0]
-    result = "spam" if pred == 1 else "ham"
-    return {"prediction": result}
+    probs = model.predict_proba([msg.text])[0]
+    predicted_class = int(np.argmax(probs))
+    prediction = LABELS[predicted_class]
+    confidence = round(float(probs[predicted_class]), 2)
+
+    # risk_score = 100 – (ham_probability × 100), clamped to [0, 100].
+    # Rationale: ham probability is the model's belief the message is
+    # safe.  Subtracting from 100 converts it to a threat score where
+    # 0 = certainly safe and 100 = certainly dangerous.
+    risk_score = max(0, min(100, round(100 - float(probs[0]) * 100)))
+
+    return {
+        "prediction": prediction,
+        "confidence": confidence,
+        "risk_score": risk_score,
+        "signals": {
+            "urgent_language": _score_phrases(msg.text, _URGENCY_PHRASES),
+            "suspicious_links": analyze_links(msg.text),
+            "financial_incentive": _score_phrases(msg.text,
+                                                  _FINANCIAL_PHRASES),
+            "sender_trust": assess_sender(msg.sender_domain),
+        },
+        "flagged_phrases": extract_flagged_phrases(msg.text,
+                                                   predicted_class),
+        "category_tags": TAG_MAP[prediction],
+    }
