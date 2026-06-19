@@ -312,6 +312,11 @@ def assess_sender(domain: Optional[str]) -> str:
 # ROUTES
 # ═══════════════════════════════════════════════════════
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.get("/")
 def root():
     return FileResponse("spam-classifier-frontend/index.html")

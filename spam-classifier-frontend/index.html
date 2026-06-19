@@ -910,7 +910,7 @@ async function runAnalysis() {
 
   let apiResult = null;
   const controller = new AbortController();
-  const tid = setTimeout(() => controller.abort(), 15000);
+  const tid = setTimeout(() => controller.abort(), 45000);
 
   try {
     const res = await fetch(API_URL, {
@@ -927,7 +927,7 @@ async function runAnalysis() {
     prog.classList.add('hidden');
     btn.disabled = false;
     renderError(err.name === 'AbortError'
-      ? 'Request timed out — please try again.'
+      ? 'Request timed out — the server may be waking up from idle, please try again in a moment.'
       : 'Could not reach the server. Check your connection.');
     return;
   }
